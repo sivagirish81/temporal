@@ -3,8 +3,11 @@ package matching
 import (
 	"math"
 	"sync"
+	"time"
 
 	enumspb "go.temporal.io/api/enums/v1"
+	"go.temporal.io/server/common/cache"
+	"go.temporal.io/server/common/clock"
 	"go.temporal.io/server/common/quotas"
 )
 
@@ -20,14 +23,39 @@ type (
 		systemRPS       float64                 // Min of partition level dispatch rates times the number of read partitions.
 		config          *taskQueueConfig        // Dynamic configuration for task queues set by system.
 		taskQueueType   enumspb.TaskQueueType   // Task queue type
-
+		timeSource      clock.TimeSource
+		adminNsRate     float64
+		adminTqRate     float64
 		// dynamicRate is the dynamic rate & burst for rate limiter
 		dynamicRateBurst quotas.MutableRateBurst
 		// dynamicRateLimiter is the dynamic rate limiter that can be used to force refresh on new rates.
 		dynamicRateLimiter *quotas.DynamicRateLimiterImpl
 		// forceRefreshRateOnce is used to force refresh rate limit for first time
 		forceRefreshRateOnce sync.Once
+
+		// Fairness tasks rate limiter.
+		wholeQueueLimit simpleLimiterParams
+		wholeQueueReady simpleLimiter
+
+		// Rate limiter for individual fairness keys.
+		// Note that we currently have only one limit for all keys, which is scaled by the key's
+		// weight. If we do this, we can assume that all keys are either at or below their rate
+		// limit at the same time, so that if the head of the queue is at its limit, then the rest
+		// must also be, and so we don't have to "skip over" the head of the queue due to rate
+		// limits. This isn't true in situations where weights have changed in between writing and
+		// reading. We'll handle that situation better in the future.
+		perKeyLimit      simpleLimiterParams
+		perKeyReady      cache.Cache
+		perKeyOverrides  fairnessWeightOverrides // TODO(fairness): get this from config
+		cancel1, cancel2 func()
 	}
+)
+
+const (
+	// How much rate limit a task queue can use up in an instant. E.g., for a rate of
+	// 100/second and burst duration of 2 seconds, the capacity of a bucket-type limiting
+	// algorithm would be 200.
+	burstDuration = time.Second
 )
 
 // Create a new rate limit manager for the task queue partition.
@@ -39,6 +67,7 @@ func newRateLimitManager(userDataManager userDataManager,
 		userDataManager: userDataManager,
 		config:          config,
 		taskQueueType:   taskQueueType,
+		perKeyReady:     cache.New(config.FairnessKeyRateLimitCacheSize(), nil),
 	}
 	r.dynamicRateBurst = quotas.NewMutableRateBurst(
 		defaultTaskDispatchRPS,
@@ -48,8 +77,37 @@ func newRateLimitManager(userDataManager userDataManager,
 		r.dynamicRateBurst,
 		config.RateLimiterRefreshInterval,
 	)
+	// Overall system rate limit will be the min of the two configs that are partition wise times the number of partions.
+	r.adminNsRate, r.cancel1 = config.AdminNamespaceToPartitionRateSub(r.setAdminNsRate)
+	r.adminTqRate, r.cancel2 = config.AdminNamespaceTaskQueueToPartitionRateSub(r.setAdminTqRate)
+
+	systemRPS := min(
+		config.AdminNamespaceTaskQueueToPartitionDispatchRate(),
+		config.AdminNamespaceToPartitionDispatchRate(),
+	) * r.getNumberOfReadPartitions()
+	r.systemRPS = systemRPS
 	r.computeEffectiveRPSAndSource()
 	return r
+}
+
+func (r *rateLimitManager) setOverallSystemRPS() {
+	systemRPS := min(
+		r.adminNsRate,
+		r.adminTqRate,
+	) * r.getNumberOfReadPartitions()
+	r.systemRPS = systemRPS
+}
+
+func (r *rateLimitManager) setAdminNsRate(rps float64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.adminNsRate = rps
+}
+
+func (r *rateLimitManager) setAdminTqRate(rps float64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.adminTqRate = rps
 }
 
 func (r *rateLimitManager) getNumberOfReadPartitions() float64 {
@@ -119,6 +177,24 @@ func (r *rateLimitManager) InjectWorkerRPS(meta *pollMetadata) {
 	r.updateRatelimitLocked()
 }
 
+// Lazy injection of poll metadata.
+// Internally call UpdateRateLimit to share the same mutex.
+func (r *rateLimitManager) InjectWorkerRPSForPriorityTaskMatcher(meta *pollMetadata) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var rps *float64
+	if meta != nil && meta.taskQueueMetadata != nil {
+		if workerRPS := meta.taskQueueMetadata.GetMaxTasksPerSecond(); workerRPS != nil {
+			value := workerRPS.GetValue()
+			rps = &value
+		}
+	}
+	r.workerRPS = rps
+	// updateRatelimitLocked includes internal logic to determine if an update is needed,
+	// so calling it unconditionally is safe and avoids redundant updates.
+	r.UpdateSimpleRateLimit()
+}
+
 // Return the effective RPS and its source together.
 // The source can be API, worker or system default.
 // It defaults to the system dynamic config.
@@ -185,4 +261,95 @@ func (r *rateLimitManager) updateRatelimitLocked() {
 		// by poller. Only need to do that once. If the rate change later, it will be refresh in 1m.
 		r.dynamicRateLimiter.Refresh()
 	})
+}
+
+// UpdateSimpleRateLimit updates the overall queue rate limits for the simpleRateLimiter implementation
+func (r *rateLimitManager) UpdateSimpleRateLimit() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.trySetRPSFromUserDataLocked()
+	r.computeEffectiveRPSAndSource()
+	rate := r.effectiveRPS
+	r.wholeQueueLimit = makeSimpleLimiterParams(rate, burstDuration)
+
+	// Clip to handle the case where we have increased from a zero or very low limit and had
+	// ready times in the far future.
+	now := r.timeSource.Now().UnixNano()
+	r.wholeQueueReady = r.wholeQueueReady.clip(r.wholeQueueLimit, now, maxTokens)
+}
+
+// UpdatePerKeySimpleRateLimit updates the per-key rate limit for the simpleRateLimit implementation
+func (r *rateLimitManager) UpdatePerKeySimpleRateLimit(rate float64, burstDuration time.Duration) {
+	r.mu.Lock()
+	defer r.mu.Lock()
+
+	r.perKeyLimit = makeSimpleLimiterParams(rate, burstDuration)
+
+	// Clip to handle the case where we have increased from a zero or very low limit and had
+	// ready times in the far future.
+	var updates map[string]simpleLimiter
+	now := r.timeSource.Now().UnixNano()
+	it := r.perKeyReady.Iterator()
+	for it.HasNext() {
+		e := it.Next()
+		sl := e.Value().(simpleLimiter) //nolint:revive
+		if clipped := sl.clip(r.perKeyLimit, now, maxTokens); clipped != sl {
+			if updates == nil {
+				updates = make(map[string]simpleLimiter)
+			}
+			updates[e.Key().(string)] = clipped
+		}
+	}
+	it.Close()
+
+	// This messes up the LRU order, but we can't avoid that here without adding new
+	// functionality to Cache.
+	for key, clipped := range updates {
+		r.perKeyReady.Put(key, clipped)
+	}
+}
+
+func (r *rateLimitManager) readyTimeForTask(task *internalTask) simpleLimiter {
+	// TODO(pri): after we have task-specific ready time, we can re-enable this
+	// if task.isForwarded() {
+	// 	// don't count any rate limit for forwarded tasks, it was counted on the child
+	// 	return 0
+	// }
+	ready := r.wholeQueueReady
+
+	if r.perKeyLimit.limited() {
+		key := task.getPriority().GetFairnessKey()
+		if v := r.perKeyReady.Get(key); v != nil {
+			ready = max(ready, v.(simpleLimiter))
+		}
+	}
+
+	return ready
+}
+
+func (r *rateLimitManager) consumeTokens(now int64, task *internalTask, tokens int64) {
+	if task.isForwarded() {
+		// don't count any rate limit for forwarded tasks, it was counted on the child
+		return
+	}
+
+	r.wholeQueueReady = r.wholeQueueReady.consume(r.wholeQueueLimit, now, tokens)
+
+	if r.perKeyLimit.limited() {
+		pri := task.getPriority()
+		key := pri.GetFairnessKey()
+		weight := getEffectiveWeight(r.perKeyOverrides, pri)
+		p := r.perKeyLimit
+		p.interval = time.Duration(float32(p.interval) / weight) // scale by weight
+		var sl simpleLimiter
+		if v := r.perKeyReady.Get(key); v != nil {
+			sl = v.(simpleLimiter) // nolint:revive
+		}
+		r.perKeyReady.Put(key, sl.consume(p, now, tokens))
+	}
+}
+
+func (r *rateLimitManager) Stop() {
+	r.cancel1()
+	r.cancel2()
 }

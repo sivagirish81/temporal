@@ -45,7 +45,7 @@ type priTaskMatcher struct {
 	adminTqRate float64
 	dynamicRate float64
 
-	cancel1, cancel2 func()
+	rateLimitManager *rateLimitManager
 }
 
 type waitingPoller struct {
@@ -64,16 +64,6 @@ type matchResult struct {
 	ctxErr    error // set if context timed out/canceled or reprocess task
 	ctxErrIdx int   // index of context that closed first
 }
-
-const (
-	// TODO(pri): old matcher cleanup, move to here
-	// defaultTaskDispatchRPS = 100000.0
-
-	// How much rate limit a task queue can use up in an instant. E.g., for a rate of
-	// 100/second and burst duration of 2 seconds, the capacity of a bucket-type limiting
-	// algorithm would be 200.
-	burstDuration = time.Second
-)
 
 var (
 	// TODO(pri): old matcher cleanup, move to here
@@ -97,22 +87,21 @@ func newPriTaskMatcher(
 	validator taskValidator,
 	logger log.Logger,
 	metricsHandler metrics.Handler,
+	rateLimitManager *rateLimitManager,
 ) *priTaskMatcher {
 	tm := &priTaskMatcher{
-		config:         config,
-		data:           newMatcherData(config, logger, clock.NewRealTimeSource(), fwdr != nil),
-		tqCtx:          tqCtx,
-		logger:         logger,
-		metricsHandler: metricsHandler,
-		partition:      partition,
-		fwdr:           fwdr,
-		validator:      validator,
-		numPartitions:  config.NumReadPartitions,
-		dynamicRate:    defaultTaskDispatchRPS,
+		config:           config,
+		data:             newMatcherData(config, logger, clock.NewRealTimeSource(), fwdr != nil),
+		tqCtx:            tqCtx,
+		logger:           logger,
+		metricsHandler:   metricsHandler,
+		partition:        partition,
+		fwdr:             fwdr,
+		validator:        validator,
+		numPartitions:    config.NumReadPartitions,
+		dynamicRate:      defaultTaskDispatchRPS,
+		rateLimitManager: rateLimitManager,
 	}
-
-	tm.adminNsRate, tm.cancel1 = config.AdminNamespaceToPartitionRateSub(tm.setAdminNsRate)
-	tm.adminTqRate, tm.cancel2 = config.AdminNamespaceTaskQueueToPartitionRateSub(tm.setAdminTqRate)
 	tm.setLimitLocked()
 
 	return tm
@@ -496,20 +485,6 @@ func (tm *priTaskMatcher) UpdateRatelimit(rps float64) {
 	tm.setLimitLocked()
 }
 
-func (tm *priTaskMatcher) setAdminNsRate(rps float64) {
-	tm.limiterLock.Lock()
-	defer tm.limiterLock.Unlock()
-	tm.adminNsRate = rps
-	tm.setLimitLocked()
-}
-
-func (tm *priTaskMatcher) setAdminTqRate(rps float64) {
-	tm.limiterLock.Lock()
-	defer tm.limiterLock.Unlock()
-	tm.adminTqRate = rps
-	tm.setLimitLocked()
-}
-
 func (tm *priTaskMatcher) setLimitLocked() {
 	perPartitionDynamicRate := tm.dynamicRate
 
@@ -524,7 +499,7 @@ func (tm *priTaskMatcher) setLimitLocked() {
 		tm.adminTqRate,
 	)
 
-	tm.data.UpdateRateLimit(rate, burstDuration)
+	tm.rateLimitManager.UpdateSimpleRateLimit()
 }
 
 // Rate returns the current dynamic rate setting

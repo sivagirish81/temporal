@@ -224,6 +224,7 @@ func newPhysicalTaskQueueManager(
 			pqMgr.taskValidator,
 			pqMgr.logger,
 			newFairMetricsHandler(taggedMetricsHandler),
+			partitionMgr.rateLimitManager,
 		)
 		pqMgr.matcher = pqMgr.priMatcher
 		return pqMgr, nil
@@ -265,6 +266,7 @@ func newPhysicalTaskQueueManager(
 			pqMgr.taskValidator,
 			pqMgr.logger,
 			newPriMetricsHandler(taggedMetricsHandler),
+			partitionMgr.rateLimitManager,
 		)
 		pqMgr.matcher = pqMgr.priMatcher
 		return pqMgr, nil
