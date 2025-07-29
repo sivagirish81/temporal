@@ -3,7 +3,6 @@ package matching
 import (
 	"context"
 	"strconv"
-	"sync"
 	"time"
 
 	"go.temporal.io/api/serviceerror"
@@ -40,9 +39,6 @@ type priTaskMatcher struct {
 	logger         log.Logger
 	numPartitions  func() int // number of task queue partitions
 
-	limiterLock sync.Mutex
-	adminNsRate float64
-	adminTqRate float64
 	dynamicRate float64
 
 	rateLimitManager *rateLimitManager
@@ -91,7 +87,7 @@ func newPriTaskMatcher(
 ) *priTaskMatcher {
 	tm := &priTaskMatcher{
 		config:           config,
-		data:             newMatcherData(config, logger, clock.NewRealTimeSource(), fwdr != nil),
+		data:             newMatcherData(config, logger, clock.NewRealTimeSource(), fwdr != nil, rateLimitManager),
 		tqCtx:            tqCtx,
 		logger:           logger,
 		metricsHandler:   metricsHandler,
@@ -130,8 +126,7 @@ func (tm *priTaskMatcher) Start() {
 }
 
 func (tm *priTaskMatcher) Stop() {
-	tm.cancel1()
-	tm.cancel2()
+	tm.rateLimitManager.Stop()
 }
 
 func (tm *priTaskMatcher) forwardTasks(lim quotas.RateLimiter, retrier backoff.Retrier) {
@@ -479,8 +474,8 @@ func (tm *priTaskMatcher) ReprocessAllTasks() {
 
 // UpdateRatelimit updates the task dispatch rate
 func (tm *priTaskMatcher) UpdateRatelimit(rps float64) {
-	tm.limiterLock.Lock()
-	defer tm.limiterLock.Unlock()
+	tm.rateLimitManager.mu.Lock()
+	defer tm.rateLimitManager.mu.Unlock()
 	tm.dynamicRate = rps
 	tm.setLimitLocked()
 }
@@ -493,20 +488,14 @@ func (tm *priTaskMatcher) setLimitLocked() {
 		perPartitionDynamicRate /= float64(n)
 	}
 
-	rate := min(
-		perPartitionDynamicRate,
-		tm.adminNsRate,
-		tm.adminTqRate,
-	)
-
-	tm.rateLimitManager.UpdateSimpleRateLimit()
+	tm.rateLimitManager.UpdateSimpleRateLimitLocked(defaultBurstDuration)
 }
 
 // Rate returns the current dynamic rate setting
 func (tm *priTaskMatcher) Rate() float64 {
-	tm.limiterLock.Lock()
-	defer tm.limiterLock.Unlock()
-	return tm.dynamicRate
+	tm.rateLimitManager.mu.Lock()
+	defer tm.rateLimitManager.mu.Unlock()
+	return tm.rateLimitManager.effectiveRPS
 }
 
 func (tm *priTaskMatcher) poll(

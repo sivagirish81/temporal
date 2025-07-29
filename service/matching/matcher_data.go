@@ -221,7 +221,7 @@ type matcherData struct {
 	lastPoller time.Time // most recent poll start time
 }
 
-func newMatcherData(config *taskQueueConfig, logger log.Logger, timeSource clock.TimeSource, canForward bool) matcherData {
+func newMatcherData(config *taskQueueConfig, logger log.Logger, timeSource clock.TimeSource, canForward bool, rateLimitManager *rateLimitManager) matcherData {
 	return matcherData{
 		config:     config,
 		logger:     logger,
@@ -230,16 +230,16 @@ func newMatcherData(config *taskQueueConfig, logger log.Logger, timeSource clock
 		tasks: taskPQ{
 			ages: newBacklogAgeTracker(),
 		},
+		rateLimitManager: rateLimitManager,
 	}
 }
 
 func (d *matcherData) EnqueueTaskNoWait(task *internalTask) {
 	d.lock.Lock()
-	defer d.lock.Unlock()
-
 	task.initMatch(d)
 	d.tasks.Add(task)
 	d.findAndWakeMatches()
+	d.lock.Unlock()
 }
 
 func (d *matcherData) RemoveTask(task *internalTask) {
@@ -253,15 +253,13 @@ func (d *matcherData) RemoveTask(task *internalTask) {
 
 func (d *matcherData) EnqueueTaskAndWait(ctxs []context.Context, task *internalTask) *matchResult {
 	d.lock.Lock()
-	defer d.lock.Unlock()
-
 	// add and look for match
 	task.initMatch(d)
 	d.tasks.Add(task)
 	d.findAndWakeMatches()
-
 	// if already matched, return
 	if task.matchResult != nil {
+		d.lock.Unlock()
 		return task.matchResult
 	}
 
@@ -279,22 +277,32 @@ func (d *matcherData) EnqueueTaskAndWait(ctxs []context.Context, task *internalT
 		defer stop() // nolint:revive // there's only ever a small number of contexts
 	}
 
-	return task.waitForMatch()
+	// Release the lock and wait for match using a channel-based approach
+	d.lock.Unlock()
+
+	// Wait for match result using a channel
+	matchChan := make(chan *matchResult, 1)
+	go func() {
+		d.lock.Lock()
+		defer d.lock.Unlock()
+		result := task.waitForMatch()
+		matchChan <- result
+	}()
+
+	return <-matchChan
 }
 
 func (d *matcherData) ReenqueuePollerIfNotMatched(poller *waitingPoller) {
-	d.lock.Lock()
-	defer d.lock.Unlock()
-
 	if poller.matchResult == nil {
+		d.lock.Lock()
 		d.pollers.Add(poller)
 		d.findAndWakeMatches()
+		d.lock.Unlock()
 	}
 }
 
 func (d *matcherData) EnqueuePollerAndWait(ctxs []context.Context, poller *waitingPoller) *matchResult {
 	d.lock.Lock()
-	defer d.lock.Unlock()
 
 	// update this for timeSinceLastPoll
 	d.lastPoller = util.MaxTime(d.lastPoller, poller.startTime)
@@ -303,9 +311,9 @@ func (d *matcherData) EnqueuePollerAndWait(ctxs []context.Context, poller *waiti
 	poller.initMatch(d)
 	d.pollers.Add(poller)
 	d.findAndWakeMatches()
-
 	// if already matched, return
 	if poller.matchResult != nil {
+		d.lock.Unlock()
 		return poller.matchResult
 	}
 
@@ -327,12 +335,23 @@ func (d *matcherData) EnqueuePollerAndWait(ctxs []context.Context, poller *waiti
 		defer stop() // nolint:revive // there's only ever a small number of contexts
 	}
 
-	return poller.waitForMatch()
+	// Release the lock and wait for match using a channel-based approach
+	d.lock.Unlock()
+
+	// Wait for match result using a channel
+	matchChan := make(chan *matchResult, 1)
+	go func() {
+		d.lock.Lock()
+		defer d.lock.Unlock()
+		result := poller.waitForMatch()
+		matchChan <- result
+	}()
+
+	return <-matchChan
 }
 
 func (d *matcherData) MatchTaskImmediately(task *internalTask) (canSyncMatch, gotSyncMatch bool) {
 	d.lock.Lock()
-	defer d.lock.Unlock()
 
 	if !d.isBacklogNegligible() {
 		// To ensure better dispatch ordering, we block sync match when a significant backlog is present.
@@ -348,9 +367,11 @@ func (d *matcherData) MatchTaskImmediately(task *internalTask) (canSyncMatch, go
 	d.findAndWakeMatches()
 	// don't wait, check if match() picked this one already
 	if task.matchResult != nil {
+		d.lock.Unlock()
 		return true, true
 	}
 	d.tasks.Remove(task)
+	d.lock.Unlock()
 	return true, false
 }
 
@@ -434,12 +455,21 @@ func (d *matcherData) allowForwarding() (allowForwarding bool) {
 	return delayToForwardingAllowed <= 0
 }
 
-// call with lock held
+// findAndWakeMatches finds and wakes up matching tasks and pollers
+// This method must be called with d.lock held
 func (d *matcherData) findAndWakeMatches() {
 	allowForwarding := d.canForward && d.allowForwarding()
 
 	r := d.rateLimitManager
+	// Get the current time and rate limit state
 	now := r.timeSource.Now().UnixNano()
+
+	// Since we already hold d.lock, we can safely access rate limit manager
+	// without additional locking to avoid deadlocks
+	wholeQueueReady := r.wholeQueueReady
+	perKeyLimit := r.perKeyLimit
+	perKeyOverrides := r.perKeyOverrides
+
 	// TODO(pri): for task-specific ready time, we need to do a full/partial re-heapify here
 
 	for {
@@ -451,8 +481,8 @@ func (d *matcherData) findAndWakeMatches() {
 			return
 		}
 
-		// check ready time
-		delay := r.readyTimeForTask(task).delay(now)
+		// check ready time using the cached rate limit state
+		delay := d.readyTimeForTaskWithState(task, now, wholeQueueReady, perKeyLimit, perKeyOverrides).delay(now)
 		d.rateLimitTimer.set(d.timeSource, d.rematchAfterTimer, delay)
 		if delay > 0 {
 			return // not ready yet, timer will call match later
@@ -462,9 +492,12 @@ func (d *matcherData) findAndWakeMatches() {
 		d.tasks.Remove(task)
 		d.pollers.Remove(poller)
 
-		// TODO(pri): maybe we can allow tasks to have costs other than 1
-		r.consumeTokens(now, task, 1)
+		// Consume tokens directly since we already hold the lock
+		d.consumeTokensDirect(now, task, 1)
 		task.recycleToken = d.recycleToken
+
+		// Update cached rate limit state after consuming tokens
+		wholeQueueReady = r.wholeQueueReady
 
 		res := &matchResult{task: task, poller: poller}
 		task.wake(d.logger, res)
@@ -479,17 +512,114 @@ func (d *matcherData) findAndWakeMatches() {
 	}
 }
 
-func (d *matcherData) recycleToken(task *internalTask) {
-	d.lock.Lock()
-	defer d.lock.Unlock()
+// readyTimeForTaskWithState calculates the ready time for a task using provided rate limit state
+// to avoid deadlocks when called from findAndWakeMatches
+func (d *matcherData) readyTimeForTaskWithState(task *internalTask, now int64, wholeQueueReady simpleLimiter, perKeyLimit simpleLimiterParams, perKeyOverrides fairnessWeightOverrides) simpleLimiter {
+	// TODO(pri): after we have task-specific ready time, we can re-enable this
+	// if task.isForwarded() {
+	// 	// don't count any rate limit for forwarded tasks, it was counted on the child
+	// 	return 0
+	// }
+	ready := wholeQueueReady
+
+	if perKeyLimit.limited() {
+		key := task.getPriority().GetFairnessKey()
+		// Get per-key ready time directly since we already hold the lock
+		r := d.rateLimitManager
+		var perKeyReady simpleLimiter
+		if v := r.perKeyReady.Get(key); v != nil {
+			perKeyReady = v.(simpleLimiter)
+		}
+
+		// Always apply per-key rate limiting, even for new keys
+		// For new keys, perKeyReady is 0, which means they can start immediately
+		// but subsequent tasks will be rate limited
+		ready = max(ready, perKeyReady)
+	}
+
+	return ready
+}
+
+// consumeTokensAtomic consumes tokens atomically to avoid deadlocks
+func (d *matcherData) consumeTokensAtomic(now int64, task *internalTask, tokens int64) {
+	if task.isForwarded() {
+		// don't count any rate limit for forwarded tasks, it was counted on the child
+		return
+	}
+
 	r := d.rateLimitManager
-	now := r.timeSource.Now().UnixNano()
-	r.consumeTokens(now, task, -1)
-	d.findAndWakeMatches() // another task may be ready to match now
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.wholeQueueReady = r.wholeQueueReady.consume(r.wholeQueueLimit, now, tokens)
+
+	if r.perKeyLimit.limited() {
+		pri := task.getPriority()
+		key := pri.GetFairnessKey()
+		weight := getEffectiveWeight(r.perKeyOverrides, pri)
+		p := r.perKeyLimit
+		p.interval = time.Duration(float32(p.interval) / weight) // scale by weight
+		var sl simpleLimiter
+		if v := r.perKeyReady.Get(key); v != nil {
+			sl = v.(simpleLimiter) // nolint:revive
+		}
+		r.perKeyReady.Put(key, sl.consume(p, now, tokens))
+	}
+}
+
+// consumeTokensDirect consumes tokens directly without additional locking
+// This method must be called with d.lock held
+func (d *matcherData) consumeTokensDirect(now int64, task *internalTask, tokens int64) {
+	if task.isForwarded() {
+		// don't count any rate limit for forwarded tasks, it was counted on the child
+		return
+	}
+
+	r := d.rateLimitManager
+	// Since we already hold d.lock, we can safely access rate limit manager fields
+	r.wholeQueueReady = r.wholeQueueReady.consume(r.wholeQueueLimit, now, tokens)
+
+	if r.perKeyLimit.limited() {
+		pri := task.getPriority()
+		key := pri.GetFairnessKey()
+		weight := getEffectiveWeight(r.perKeyOverrides, pri)
+		p := r.perKeyLimit
+		p.interval = time.Duration(float32(p.interval) / weight) // scale by weight
+		var sl simpleLimiter
+		if v := r.perKeyReady.Get(key); v != nil {
+			sl = v.(simpleLimiter) // nolint:revive
+		}
+		r.perKeyReady.Put(key, sl.consume(p, now, tokens))
+	}
+}
+
+func (d *matcherData) recycleToken(task *internalTask) {
+	// Use a goroutine to avoid deadlocks when recycleToken is called from finish()
+	// which may already hold locks
+	go func() {
+		r := d.rateLimitManager
+		r.mu.Lock()
+		now := r.timeSource.Now().UnixNano()
+		r.consumeTokens(now, task, -1)
+		r.mu.Unlock()
+
+		// Schedule a match attempt without holding any locks
+		// This avoids the deadlock scenario where recycleToken is called
+		// while holding rateLimitManager.mu and findAndWakeMatches tries
+		// to acquire matcherData.lock
+		d.scheduleMatchAttempt()
+	}()
+}
+
+// scheduleMatchAttempt schedules a match attempt without holding any locks
+func (d *matcherData) scheduleMatchAttempt() {
+	// Use a timer to schedule the match attempt to avoid deadlocks
+	d.rateLimitTimer.set(d.timeSource, d.rematchAfterTimer, 0)
 }
 
 // called from timer
 func (d *matcherData) rematchAfterTimer() {
+	// Timer callbacks should not hold any locks, so we need to acquire the lock here
 	d.lock.Lock()
 	defer d.lock.Unlock()
 	d.findAndWakeMatches()
@@ -541,7 +671,8 @@ func (w *waitableMatchResult) wake(logger log.Logger, res *matchResult) {
 	w.matchCond.Signal()
 }
 
-// call with matcherData.lock held
+// waitForMatch waits for a match result to be set
+// This method must be called with matcherData.lock held
 func (w *waitableMatchResult) waitForMatch() *matchResult {
 	for w.matchResult == nil {
 		w.matchCond.Wait()
