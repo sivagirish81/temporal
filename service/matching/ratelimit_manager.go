@@ -3,11 +3,16 @@ package matching
 import (
 	"math"
 	"sync"
+<<<<<<< HEAD
 	"time"
 
 	enumspb "go.temporal.io/api/enums/v1"
 	"go.temporal.io/server/common/cache"
 	"go.temporal.io/server/common/clock"
+=======
+
+	enumspb "go.temporal.io/api/enums/v1"
+>>>>>>> origin/main
 	"go.temporal.io/server/common/quotas"
 )
 
@@ -20,22 +25,29 @@ type (
 		userDataManager userDataManager         // User data manager to fetch user data for task queue configurations.
 		workerRPS       *float64                // RPS set by worker at the time of polling, if available.
 		apiConfigRPS    *float64                // RPS set via API, if available.
+<<<<<<< HEAD
 		fairnessRPS     *float64                // fairnessKeyRateLimitDefault set via API, if available
+=======
+>>>>>>> origin/main
 		systemRPS       float64                 // Min of partition level dispatch rates times the number of read partitions.
 		config          *taskQueueConfig        // Dynamic configuration for task queues set by system.
 		taskQueueType   enumspb.TaskQueueType   // Task queue type
 
+<<<<<<< HEAD
 		timeSource        clock.TimeSource
 		adminNsRate       float64
 		adminTqRate       float64
 		numReadPartitions int
 
+=======
+>>>>>>> origin/main
 		// dynamicRate is the dynamic rate & burst for rate limiter
 		dynamicRateBurst quotas.MutableRateBurst
 		// dynamicRateLimiter is the dynamic rate limiter that can be used to force refresh on new rates.
 		dynamicRateLimiter *quotas.DynamicRateLimiterImpl
 		// forceRefreshRateOnce is used to force refresh rate limit for first time
 		forceRefreshRateOnce sync.Once
+<<<<<<< HEAD
 
 		// Fairness tasks rate limiter.
 		wholeQueueLimit simpleLimiterParams
@@ -62,6 +74,11 @@ const (
 	defaultBurstDuration = time.Second
 )
 
+=======
+	}
+)
+
+>>>>>>> origin/main
 // Create a new rate limit manager for the task queue partition.
 func newRateLimitManager(userDataManager userDataManager,
 	config *taskQueueConfig,
@@ -71,8 +88,11 @@ func newRateLimitManager(userDataManager userDataManager,
 		userDataManager: userDataManager,
 		config:          config,
 		taskQueueType:   taskQueueType,
+<<<<<<< HEAD
 		perKeyReady:     cache.New(config.FairnessKeyRateLimitCacheSize(), nil),
 		timeSource:      clock.NewRealTimeSource(),
+=======
+>>>>>>> origin/main
 	}
 	r.dynamicRateBurst = quotas.NewMutableRateBurst(
 		defaultTaskDispatchRPS,
@@ -82,14 +102,18 @@ func newRateLimitManager(userDataManager userDataManager,
 		r.dynamicRateBurst,
 		config.RateLimiterRefreshInterval,
 	)
+<<<<<<< HEAD
 	// Overall system rate limit will be the min of the two configs that are partition wise times the number of partions.
 	r.adminNsRate, r.cancel1 = config.AdminNamespaceToPartitionRateSub(r.setAdminNsRate)
 	r.adminTqRate, r.cancel2 = config.AdminNamespaceTaskQueueToPartitionRateSub(r.setAdminTqRate)
 	r.numReadPartitions, r.cancel3 = config.NumReadPartitionsSub(r.setNumReadPartitions)
+=======
+>>>>>>> origin/main
 	r.computeEffectiveRPSAndSource()
 	return r
 }
 
+<<<<<<< HEAD
 func (r *rateLimitManager) setAdminNsRate(rps float64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -111,6 +135,15 @@ func (r *rateLimitManager) setNumReadPartitions(val int) {
 	} else {
 		r.numReadPartitions = val
 	}
+=======
+func (r *rateLimitManager) getNumberOfReadPartitions() float64 {
+	nPartitions := float64(r.config.NumReadPartitions())
+	if nPartitions <= 0 {
+		// Defaulting to 1 partition if misconfigured
+		nPartitions = 1
+	}
+	return nPartitions
+>>>>>>> origin/main
 }
 
 func (r *rateLimitManager) computeEffectiveRPSAndSource() {
@@ -131,9 +164,15 @@ func (r *rateLimitManager) computeEffectiveRPSAndSourceLocked() {
 	)
 	// Overall system rate limit will be the min of the two configs that are partition wise times the number of partions.
 	systemRPS := min(
+<<<<<<< HEAD
 		r.adminNsRate,
 		r.adminTqRate,
 	) * float64(r.numReadPartitions)
+=======
+		r.config.AdminNamespaceTaskQueueToPartitionDispatchRate(),
+		r.config.AdminNamespaceToPartitionDispatchRate(),
+	) * r.getNumberOfReadPartitions()
+>>>>>>> origin/main
 	r.systemRPS = systemRPS
 	switch {
 	case r.apiConfigRPS != nil:
