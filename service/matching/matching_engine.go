@@ -3124,3 +3124,21 @@ func (e *matchingEngineImpl) UpdateTaskQueueConfig(ctx context.Context, request 
 		UpdatedTaskqueueConfig: userData.GetData().GetPerType()[int32(taskQueueType)].GetConfig(),
 	}, nil
 }
+
+// TryConsumeTaskQueueTokens attempts a non-blocking token consumption for a task queue.
+func (e *matchingEngineImpl) TryConsumeTaskQueueTokens(ctx context.Context, request *matchingservice.TryConsumeTaskQueueTokensRequest) (bool, error) {
+    partition, err := tqid.NormalPartitionFromRpcName(request.GetTaskQueue(), request.GetNamespaceId(), request.GetTaskQueueType())
+    if err != nil {
+        return false, err
+    }
+    pm, _, err := e.getTaskQueuePartitionManager(ctx, partition, true, loadCauseOtherRead)
+    if err != nil {
+        return false, err
+    }
+    rlm := pm.GetRateLimitManager()
+    tokens := int64(1)
+    if request.GetNumTokens() > 0 {
+        tokens = int64(request.GetNumTokens())
+    }
+    return rlm.TryConsumeTokensNow(request.GetFairnessKey(), request.GetFairnessWeight(), tokens), nil
+}

@@ -370,3 +370,43 @@ func (r *rateLimitManager) GetFairnessWeightOverrides() fairnessWeightOverrides 
 	defer r.mu.Unlock()
 	return r.perKeyOverrides
 }
+
+// TryConsumeTokensNow returns true and consumes tokens if allowed right now.
+// If per-key limiting is configured, it considers the fairness key and weight.
+func (r *rateLimitManager) TryConsumeTokensNow(fairnessKey string, fairnessWeight float32, tokens int64) bool {
+    r.mu.Lock()
+    defer r.mu.Unlock()
+
+    // If fairness per-key limiting is configured, use the simple limiter path
+    // for both whole-queue and per-key gating.
+    if r.perKeyLimit.limited() {
+        now := r.timeSource.Now().UnixNano()
+        // whole-queue gate
+        if r.wholeQueueReady.delay(now) > 0 {
+            return false
+        }
+        // per-key gate
+        p := r.perKeyLimit
+        if fairnessWeight > 0 {
+            p.interval = time.Duration(float32(p.interval) / max(fairnessWeight, minWeight))
+        }
+        var ready simpleLimiter
+        if v := r.perKeyReady.Get(fairnessKey); v != nil {
+            ready = v.(simpleLimiter)
+        }
+        if ready.delay(now) > 0 {
+            return false
+        }
+        // consume per-key and whole-queue tokens
+        r.perKeyReady.Put(fairnessKey, ready.consume(p, now, tokens))
+        r.wholeQueueReady = r.wholeQueueReady.consume(r.wholeQueueLimit, now, tokens)
+        return true
+    }
+
+    // Otherwise fall back to the legacy dynamic rate limiter used by the old matcher.
+    // If it's effectively unlimited, AllowN will always return true, which is fine.
+    if r.dynamicRateLimiter == nil {
+        return true
+    }
+    return r.dynamicRateLimiter.AllowN(r.timeSource.Now(), int(tokens))
+}
