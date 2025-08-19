@@ -25,6 +25,23 @@ import "temporal/api/workflowservice/v1/request_response.proto";
 import "temporal/api/nexus/v1/message.proto";
 import "temporal/api/worker/v1/message.proto";
 
+// TryConsumeTaskQueueTokensRequest attempts a non-blocking consumption of tokens from
+// the task queue rate limiter (and optional fairness key limiter). If allowed, the
+// limiter state is advanced and the tokens are considered consumed.
+message TryConsumeTaskQueueTokensRequest {
+    string namespace_id = 1;
+    string task_queue = 2;
+    temporal.api.enums.v1.TaskQueueType task_queue_type = 3;
+    int32 num_tokens = 4; // defaults to 1 when unset
+    string fairness_key = 5;
+    float fairness_weight = 6;
+    string reason = 7;
+}
+
+message TryConsumeTaskQueueTokensResponse {
+    bool allowed = 1;
+}
+
 message PollWorkflowTaskQueueRequest {
     string namespace_id = 1;
     string poller_id = 2;

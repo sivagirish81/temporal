@@ -341,6 +341,27 @@ func (h *Handler) DescribeVersionedTaskQueues(
 	return h.engine.DescribeVersionedTaskQueues(ctx, request)
 }
 
+// TryConsumeTaskQueueTokens attempts a non-blocking token consumption for eager exec decisions.
+func (h *Handler) TryConsumeTaskQueueTokens(
+    ctx context.Context,
+    request *matchingservice.TryConsumeTaskQueueTokensRequest,
+) (_ *matchingservice.TryConsumeTaskQueueTokensResponse, retError error) {
+    defer log.CapturePanic(h.logger, &retError)
+    // Minimal metrics; we can refine tags later if needed
+    opMetrics := h.opMetricsHandler(
+        request.GetNamespaceId(),
+        &taskqueuepb.TaskQueue{Name: request.GetTaskQueue()},
+        request.GetTaskQueueType(),
+        "TryConsumeTaskQueueTokens",
+    )
+
+    allowed, err := h.engine.TryConsumeTaskQueueTokens(ctx, request)
+    if err != nil {
+        return nil, err
+    }
+    return &matchingservice.TryConsumeTaskQueueTokensResponse{Allowed: allowed}, nil
+}
+
 // DescribeTaskQueuePartition returns information about the target task queue partition.
 func (h *Handler) DescribeTaskQueuePartition(
 	ctx context.Context,

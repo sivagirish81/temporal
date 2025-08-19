@@ -46,5 +46,7 @@ type (
 		GetWorkerVersioningRules(ctx context.Context, request *matchingservice.GetWorkerVersioningRulesRequest) (*matchingservice.GetWorkerVersioningRulesResponse, error)
 		DescribeVersionedTaskQueues(ctx context.Context, request *matchingservice.DescribeVersionedTaskQueuesRequest) (*matchingservice.DescribeVersionedTaskQueuesResponse, error)
 		UpdateTaskQueueConfig(ctx context.Context, request *matchingservice.UpdateTaskQueueConfigRequest) (*matchingservice.UpdateTaskQueueConfigResponse, error)
+		// TryConsumeTaskQueueTokens is used by history to check if eager activity can proceed.
+		TryConsumeTaskQueueTokens(ctx context.Context, request *matchingservice.TryConsumeTaskQueueTokensRequest) (bool, error)
 	}
 )

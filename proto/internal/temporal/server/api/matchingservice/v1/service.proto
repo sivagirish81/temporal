@@ -79,6 +79,11 @@ service MatchingService {
     rpc DescribeVersionedTaskQueues (DescribeVersionedTaskQueuesRequest) returns (DescribeVersionedTaskQueuesResponse) {
     }
 
+    // TryConsumeTaskQueueTokens attempts to consume tokens from the specified task queue's
+    // rate limiter (including fairness key limiter) without enqueuing a task. Returns whether
+    // the consumption succeeded.
+    rpc TryConsumeTaskQueueTokens (TryConsumeTaskQueueTokensRequest) returns (TryConsumeTaskQueueTokensResponse) {}
+
     // ListTaskQueuePartitions returns a map of partitionKey and hostAddress for a task queue.
     rpc  ListTaskQueuePartitions(ListTaskQueuePartitionsRequest) returns (ListTaskQueuePartitionsResponse){
     }

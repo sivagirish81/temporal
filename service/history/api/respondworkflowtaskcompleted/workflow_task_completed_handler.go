@@ -425,7 +425,7 @@ func (handler *workflowTaskCompletedHandler) handleCommandProtocolMessage(
 }
 
 func (handler *workflowTaskCompletedHandler) handleCommandScheduleActivity(
-	_ context.Context,
+	ctx context.Context,
 	attr *commandpb.ScheduleActivityTaskCommandAttributes,
 ) (*historypb.HistoryEvent, *handleCommandResponse, error) {
 	executionInfo := handler.mutableState.GetExecutionInfo()
@@ -499,15 +499,25 @@ func (handler *workflowTaskCompletedHandler) handleCommandScheduleActivity(
 	eagerStartActivity := attr.RequestEagerExecution && handler.config.EnableActivityEagerExecution(namespace) &&
 		(!versioningUsed || attr.UseWorkflowBuildId)
 
-	// Disable eager activities if rate limits are configured for the task queue
-	// This prevents eager activities from bypassing server-side rate limiting
-	if eagerStartActivity && handler.hasTaskQueueRateLimit(attr.TaskQueue.GetName(), enumspb.TASK_QUEUE_TYPE_ACTIVITY) {
-		metrics.WorkflowEagerExecutionDeniedCounter.With(handler.metricsHandler).
-			Record(1, metrics.ReasonTag("rate_limit_configured"))
-		eagerStartActivity = false
-	} else if eagerStartActivity {
-		// Record successful eager activity execution
-		metrics.ActivityEagerExecutionCounter.With(handler.metricsHandler).Record(1)
+	// Dynamic eager: only proceed if matching allows consuming a token now
+	if eagerStartActivity {
+		req := &matchingservice.TryConsumeTaskQueueTokensRequest{
+			NamespaceId:    handler.mutableState.GetNamespaceEntry().ID().String(),
+			TaskQueue:      attr.TaskQueue.GetName(),
+			TaskQueueType:  enumspb.TASK_QUEUE_TYPE_ACTIVITY,
+			NumTokens:      1,
+			FairnessKey:    attr.GetPriority().GetFairnessKey(),
+			FairnessWeight: attr.GetPriority().GetFairnessWeight(),
+			Reason:         "eager_activity",
+		}
+		resp, err := handler.matchingClient.TryConsumeTaskQueueTokens(ctx, req)
+		if err != nil || !resp.GetAllowed() {
+			metrics.WorkflowEagerExecutionDeniedCounter.With(handler.metricsHandler).
+				Record(1, metrics.ReasonTag("rate_limit_denied"))
+			eagerStartActivity = false
+		} else {
+			metrics.ActivityEagerExecutionCounter.With(handler.metricsHandler).Record(1)
+		}
 	}
 
 	event, _, err := handler.mutableState.AddActivityTaskScheduledEvent(
