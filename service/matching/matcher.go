@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	taskqueuepb "go.temporal.io/api/taskqueue/v1"
 	enumsspb "go.temporal.io/server/api/enums/v1"
 	"go.temporal.io/server/api/matchingservice/v1"
 	"go.temporal.io/server/common/metrics"
@@ -41,6 +42,7 @@ type TaskMatcher struct {
 	metricsHandler         metrics.Handler // namespace metric scope
 	backlogTasksCreateTime map[int64]int   // task creation time (unix nanos) -> number of tasks with that time
 	backlogTasksLock       sync.Mutex
+	syncBacklog            syncMatchBacklogTracker
 	lastPoller             atomic.Int64 // unix nanos of most recent poll start time
 	waitingPollerCount     atomic.Int64
 }
@@ -75,6 +77,10 @@ func (tm *TaskMatcher) Stop() {
 
 func (tm *TaskMatcher) recycleToken(*internalTask) {
 	tm.rateLimiter.RecycleToken()
+}
+
+func (tm *TaskMatcher) SyncMatchStatsByPriority() map[int32]*taskqueuepb.TaskQueueStats {
+	return tm.syncBacklog.statsByPriority()
 }
 
 // Offer offers a task to a potential consumer (poller)
@@ -219,11 +225,14 @@ func syncOfferTask[T any](
 			}
 		}
 
+		tm.syncBacklog.record(task, 1)
 		select {
 		case taskChan <- task:
+			tm.syncBacklog.record(task, -1)
 			<-task.responseC
 			return t, nil
 		case token := <-fwdrTokenC:
+			tm.syncBacklog.record(task, -1)
 			resp, err := forwardFunc(ctx, task)
 			token.release()
 			if err == nil {
@@ -237,6 +246,7 @@ func syncOfferTask[T any](
 			}
 			return t, err
 		case <-noPollerC:
+			tm.syncBacklog.record(task, -1)
 			// only error if there has not been a recent poller. Otherwise, let it wait for the remaining time
 			// hopping for a match, or ultimately returning the default CDE error.
 			if tm.timeSinceLastPoll() > tm.config.QueryPollerUnavailableWindow() {
@@ -244,6 +254,7 @@ func syncOfferTask[T any](
 			}
 			continue
 		case <-ctx.Done():
+			tm.syncBacklog.record(task, -1)
 			return t, ctx.Err()
 		}
 	}

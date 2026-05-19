@@ -24,6 +24,7 @@ import (
 	"go.temporal.io/server/common/metrics"
 	"go.temporal.io/server/common/payloads"
 	"go.temporal.io/server/common/quotas"
+	"go.temporal.io/server/common/testing/await"
 	"go.temporal.io/server/common/tqid"
 	"go.uber.org/mock/gomock"
 	"google.golang.org/grpc"
@@ -586,6 +587,53 @@ func (t *MatcherTestSuite) TestQueryLocalSyncMatch() {
 	cancel()
 	t.NoError(err)
 	t.Nil(resp)
+}
+
+func (t *MatcherTestSuite) TestQuerySyncMatchStatsLocalWait() {
+	task := newInternalQueryTask(uuid.NewString(), &matchingservice.QueryWorkflowRequest{})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := t.rootMatcher.OfferQuery(ctx, task)
+		done <- err
+	}()
+
+	await.RequireTrue(t.T(), func() bool {
+		return t.rootMatcher.SyncMatchStatsByPriority()[0].GetApproximateBacklogCount() == 1
+	}, time.Second, 10*time.Millisecond)
+
+	pollCtx, pollCancel := context.WithTimeout(context.Background(), time.Second)
+	polledTask, err := t.rootMatcher.PollForQuery(pollCtx, &pollMetadata{})
+	pollCancel()
+	t.Require().NoError(err)
+	t.Same(task, polledTask)
+	await.RequireTrue(t.T(), func() bool {
+		return len(t.rootMatcher.SyncMatchStatsByPriority()) == 0
+	}, time.Second, 10*time.Millisecond)
+
+	polledTask.finish(nil, true)
+	t.NoError(<-done)
+}
+
+func (t *MatcherTestSuite) TestQuerySyncMatchStatsRemovedOnCancel() {
+	task := newInternalQueryTask(uuid.NewString(), &matchingservice.QueryWorkflowRequest{})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := t.rootMatcher.OfferQuery(ctx, task)
+		done <- err
+	}()
+
+	await.RequireTrue(t.T(), func() bool {
+		return t.rootMatcher.SyncMatchStatsByPriority()[0].GetApproximateBacklogCount() == 1
+	}, time.Second, 10*time.Millisecond)
+
+	cancel()
+	t.Require().ErrorIs(<-done, context.Canceled)
+	t.Empty(t.rootMatcher.SyncMatchStatsByPriority())
 }
 
 func (t *MatcherTestSuite) TestQueryRemoteSyncMatch() {

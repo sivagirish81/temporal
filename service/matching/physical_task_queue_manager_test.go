@@ -14,6 +14,7 @@ import (
 	"github.com/stretchr/testify/suite"
 	enumspb "go.temporal.io/api/enums/v1"
 	taskqueuepb "go.temporal.io/api/taskqueue/v1"
+	"go.temporal.io/server/api/matchingservice/v1"
 	"go.temporal.io/server/api/matchingservicemock/v1"
 	persistencespb "go.temporal.io/server/api/persistence/v1"
 	"go.temporal.io/server/common"
@@ -25,6 +26,7 @@ import (
 	"go.temporal.io/server/common/namespace"
 	"go.temporal.io/server/common/primitives/timestamp"
 	"go.temporal.io/server/common/quotas"
+	"go.temporal.io/server/common/testing/await"
 	"go.temporal.io/server/common/testing/testlogger"
 	"go.temporal.io/server/common/tqid"
 	"go.uber.org/mock/gomock"
@@ -181,6 +183,29 @@ func (s *PhysicalTaskQueueManagerTestSuite) getTaskManager() *testTaskManager {
 		return s.tqMgr.partitionMgr.engine.fairTaskManager.(*testTaskManager)
 	}
 	return s.tqMgr.partitionMgr.engine.taskManager.(*testTaskManager)
+}
+
+func (s *PhysicalTaskQueueManagerTestSuite) TestGetStatsByPriorityIncludesSyncMatchBacklog() {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+
+	task := newInternalQueryTask(uuid.NewString(), &matchingservice.QueryWorkflowRequest{})
+	done := make(chan error, 1)
+	go func() {
+		_, err := s.tqMgr.DispatchQueryTask(ctx, task)
+		done <- err
+	}()
+
+	await.RequireTrue(s.T(), func() bool {
+		stats := s.tqMgr.GetStatsByPriority(false)
+		return stats[0].GetApproximateBacklogCount() == 1 &&
+			stats[0].GetApproximateBacklogAge().AsDuration() >= 0
+	}, time.Second, 10*time.Millisecond)
+
+	cancel()
+	s.Require().Error(<-done)
+	await.RequireTrue(s.T(), func() bool {
+		return s.tqMgr.GetStatsByPriority(false)[0].GetApproximateBacklogCount() == 0
+	}, time.Second, 10*time.Millisecond)
 }
 
 // TODO(pri): old matcher cleanup

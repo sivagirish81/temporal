@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	taskqueuepb "go.temporal.io/api/taskqueue/v1"
 	enumsspb "go.temporal.io/server/api/enums/v1"
 	"go.temporal.io/server/common/clock"
 	"go.temporal.io/server/common/log"
@@ -122,6 +123,8 @@ type taskPQ struct {
 	// note that matcherData may get tasks from multiple versioned backlogs due to
 	// versioning redirection.
 	ages backlogAgeTracker
+
+	syncBacklog *syncMatchBacklogTracker
 }
 
 func (t *taskPQ) Add(task *internalTask) {
@@ -193,6 +196,9 @@ func (t *taskPQ) Push(x any) {
 	if task.source == enumsspb.TASK_SOURCE_DB_BACKLOG && task.forwardInfo == nil {
 		t.ages.record(task.event.Data.CreateTime, 1)
 	}
+	if t.syncBacklog != nil {
+		t.syncBacklog.record(task, 1)
+	}
 }
 
 // implements heap.Interface, do not call directly
@@ -204,6 +210,9 @@ func (t *taskPQ) Pop() any {
 
 	if task.source == enumsspb.TASK_SOURCE_DB_BACKLOG && task.forwardInfo == nil {
 		t.ages.record(task.event.Data.CreateTime, -1)
+	}
+	if t.syncBacklog != nil {
+		t.syncBacklog.record(task, -1)
 	}
 
 	return task
@@ -220,6 +229,9 @@ func (t *taskPQ) ForEachTask(pred func(*internalTask) bool, post func(*internalT
 		task.matchHeapIndex = invalidHeapIndex - 1 // maintain heap/index invariant
 		if task.source == enumsspb.TASK_SOURCE_DB_BACKLOG && task.forwardInfo == nil {
 			t.ages.record(task.event.Data.CreateTime, -1)
+		}
+		if t.syncBacklog != nil {
+			t.syncBacklog.record(task, -1)
 		}
 		post(task)
 		return true
@@ -254,6 +266,7 @@ type matcherData struct {
 }
 
 func newMatcherData(config *taskQueueConfig, logger log.Logger, timeSource clock.TimeSource, canForward bool, rateLimitManager *rateLimitManager) matcherData {
+	syncBacklog := &syncMatchBacklogTracker{}
 	return matcherData{
 		config:           config,
 		logger:           logger,
@@ -261,7 +274,8 @@ func newMatcherData(config *taskQueueConfig, logger log.Logger, timeSource clock
 		canForward:       canForward,
 		rateLimitManager: rateLimitManager,
 		tasks: taskPQ{
-			ages: newBacklogAgeTracker(),
+			ages:        newBacklogAgeTracker(),
+			syncBacklog: syncBacklog,
 		},
 	}
 }
@@ -589,6 +603,13 @@ func (d *matcherData) TimeSinceLastPoll() time.Duration {
 	d.lock.Lock()
 	defer d.lock.Unlock()
 	return time.Since(d.lastPoller)
+}
+
+func (d *matcherData) SyncMatchStatsByPriority() map[int32]*taskqueuepb.TaskQueueStats {
+	if d.tasks.syncBacklog == nil {
+		return nil
+	}
+	return d.tasks.syncBacklog.statsByPriority()
 }
 
 // HasWaitingPoller returns if there's a normal (non forwarder)

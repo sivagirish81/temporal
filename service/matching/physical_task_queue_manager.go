@@ -104,6 +104,7 @@ type (
 		PollForQuery(ctx context.Context, pollMetadata *pollMetadata) (*internalTask, error)
 		OfferQuery(ctx context.Context, task *internalTask) (*matchingservice.QueryWorkflowResponse, error)
 		OfferNexusTask(ctx context.Context, task *internalTask) (*matchingservice.DispatchNexusTaskResponse, error)
+		SyncMatchStatsByPriority() map[int32]*taskqueuepb.TaskQueueStats
 		ReprocessAllTasks()
 		HasWaitingPoller() bool
 	}
@@ -661,6 +662,10 @@ func (c *physicalTaskQueueManagerImpl) GetStatsByPriority(includeRates bool) map
 		for pri, tqs := range drainStats {
 			taskqueue.MergeStats(util.GetOrSetNew(stats, pri), tqs)
 		}
+	}
+
+	for pri, tqs := range c.matcher.SyncMatchStatsByPriority() {
+		taskqueue.MergeStats(util.GetOrSetNew(stats, pri), tqs)
 	}
 
 	if includeRates {
